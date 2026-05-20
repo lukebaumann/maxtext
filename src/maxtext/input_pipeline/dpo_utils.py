@@ -31,6 +31,10 @@ class DPODataFormatting(grain.MapTransform):
   data_column_names: tuple[str, ...]
   max_prompt_length: int | None = None
 
+  def __post_init__(self):
+    if self.max_prompt_length is None:
+      self.max_prompt_length = self.max_target_length // 2
+
   def map(self, element):
     "Apply the dataset transformations for DPO."
     # 1. Reformat/Extract Columns
@@ -64,17 +68,16 @@ class DPODataFormatting(grain.MapTransform):
       ) from e
 
     # 2. Padding and Masking
-    max_prompt_length = self.max_prompt_length or (self.max_target_length // 2)
-    max_response_length = self.max_target_length - max_prompt_length
+    max_response_length = self.max_target_length - self.max_prompt_length
 
-    assert max_prompt_length > 0, (
+    assert self.max_prompt_length > 0, (
         "max_prompt_length must be positive. " "Check the configs for 'max_prompt_length' and 'max_target_length'."
     )
     assert max_response_length > 0, (
         "max_response_length must be positive. " "Check the configs for 'max_prompt_length' and 'max_target_length'."
     )
 
-    prompt_ids = self._pad(input_ids, max_prompt_length, left=True)
+    prompt_ids = self._pad(input_ids, self.max_prompt_length, left=True)
     chosen_ids = self._pad(chosen_ids, max_response_length, left=False)
     rejected_ids = self._pad(rejected_ids, max_response_length, left=False)
 
