@@ -12,9 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Integration test for comparing MaxText/Tunix DPO training stack against Hugging Face TRL-inspired implementation.
+"""Integration test for comparing MaxText/Tunix DPO/ORPO training stack against Hugging Face TRL-inspired implementation.
 
-This test validates the mathematical correctness of the train_dpo.py pipeline.
+This test validates the mathematical correctness of both DPO (Direct Preference Optimization)
+and ORPO (Odds Ratio Preference Optimization) modes in the train_dpo.py pipeline.
 
 Goals of this test:
 1. Backpropagation & Optimizer Parity: Verifies that JAX successfully runs the backward pass and updates
@@ -26,26 +27,27 @@ Goals of this test:
 3. Parity on Diverged Models: Verifies that JAX and PyTorch forward logits remain aligned on diverged
    weights after training has occurred, ensuring that numerical computations do not drift over time.
 
-Test Flow:
-1. Local Dataset Setup: Configures a temporary JSON dataset with prompt/chosen/rejected strings.
-   Steps 1 and 2 use different prompt-response pairs to simulate training history variation.
-   Step 3 uses the target evaluation prompt.
-2. JAX DPO Training Loop: Runs the JAX trainer for exactly 3 steps.
-3. Weights Sync: Captures the JAX policy and reference model states at the start of Step 3,
-   synchronizing parameters to equivalent PyTorch Qwen2 model structures on-the-fly.
-4. PyTorch Golden Reference: Computes reference log-probabilities and DPO loss using the synced weights.
-5. Step 3 Parity Check: Compares JAX Step 3 metrics (loss, chosen/rejected log probabilities)
-   against the PyTorch golden reference. This verifies that state synchronization and forward
-   pass computations match and are immune to prior training history.
+Flow differences between DPO and ORPO scenarios:
+- DPO (Direct Preference Optimization):
+  * Requires two model structures: Policy and Reference.
+  * The reference model is kept frozen (synchronized at step 1, train_steps == 0) to anchor training.
+  * The policy model learns and diverges across training steps, synchronized at step 3 (train_steps == 2).
+  * Golden PyTorch references compute log probabilities for both models and evaluate DPO loss using KL penalty (beta).
+- ORPO (Odds Ratio Preference Optimization):
+  * Requires only a single model structure: Policy (no reference model is constructed or synced!).
+  * Reference syncing is bypassed; only the policy model's weights are synchronized at step 3.
+  * Golden PyTorch reference computes log probabilities for the policy model only, and evaluates the SFT
+    cross-entropy loss on the chosen completions combined with the preference odds ratio penalty (lambda_orpo).
 
 To execute:
-  pytest tests/post_training/integration/dpo_trl_correctness_test.py
+  pytest tests/post_training/integration/dpo_trainer_correctness_test.py
 """
 
 import json
 import os
 import tempfile
 import unittest
+from typing import Any
 import numpy as np
 import pytest
 
@@ -65,10 +67,390 @@ from maxtext.trainers.post_train.dpo import hooks as dpo_hooks
 pytestmark = [pytest.mark.post_training, pytest.mark.integration_test]
 
 
-def get_pytorch_reference(policy_model, ref_model, tokenizer, prompt_str, chosen_str, rejected_str, beta=0.1):
-  """Computes reference chosen/rejected logps and DPO loss in PyTorch using raw, unpadded sequences."""
+# ==============================================================================
+# 1. PRIMARY TEST SUITE
+# ==============================================================================
+# The tests in this suite validate log probability and loss parity by executing:
+#   (a) Symmetrical PyTorch tiny model structures initialization.
+#   (b) A real JAX trainer run with a custom InterceptingTrainingHooks class.
+#   (c) Live parameter copying from JAX to PyTorch structures during JAX training.
+#   (d) A golden, unpadded PyTorch reference calculation evaluating the synced diverged state.
+#   (e) Strict matching of losses, reward margins, and token log probs.
+# ==============================================================================
+class DPOTRLCorrectnessTest(unittest.TestCase):
+
+  COMMON_PROMPT = "What is preference optimization?"
+  COMMON_CHOSEN = "Preference optimization is a method for aligning LLMs using pairs of chosen and rejected responses."
+  COMMON_REJECTED = "Preference optimization is an operation to choose preferred options in a generic database."
+
+  @classmethod
+  def setUpClass(cls):
+    # Set JAX default platform to CPU to eliminate CPU/TPU accelerator math variations
+    jax.config.update("jax_platforms", "cpu")
+    # Set JAX to CPU/TPU PRNG and SPMD defaults
+    jax.config.update("jax_default_prng_impl", "unsafe_rbg")
+    if "xla_tpu_spmd_rng_bit_generator_unsafe" not in os.environ.get("LIBTPU_INIT_ARGS", ""):
+      os.environ["LIBTPU_INIT_ARGS"] = (
+          os.environ.get("LIBTPU_INIT_ARGS", "") + " --xla_tpu_spmd_rng_bit_generator_unsafe=true"
+      )
+
+    # Monkeypatch the training hooks class dynamically
+    dpo_hooks.DPOTrainingHooks = InterceptingTrainingHooks
+
+  @classmethod
+  def tearDownClass(cls):
+    # Restore original hooks to prevent polluting other tests
+    dpo_hooks.DPOTrainingHooks = _original_training_hooks
+
+  def setUp(self):
+    super().setUp()
+    InterceptingTrainingHooks.captured_metrics = []
+    InterceptingTrainingHooks.last_batch = None
+    InterceptingTrainingHooks.torch_policy_model = None
+    InterceptingTrainingHooks.torch_ref_model = None
+
+  def tearDown(self):
+    super().tearDown()
+    InterceptingTrainingHooks.captured_metrics = []
+    InterceptingTrainingHooks.last_batch = None
+    InterceptingTrainingHooks.torch_policy_model = None
+    InterceptingTrainingHooks.torch_ref_model = None
+
+  def test_maxtext_pytorch_dpo_parity(self):
+    model_id = "Qwen/Qwen2.5-1.5B-Instruct"
+
+    max_prompt_len = 144  # We intentionally set max_prompt_len != max_sequence_length to test the padding logic.
+    max_response_len = 112
+    max_target_length = max_prompt_len + max_response_len
+    beta = 0.1
+
+    # 1. Initialize Symmetrical PyTorch model structures and register them with test hooks
+    print("Initializing PyTorch tiny Qwen2 model...")
+    torch_config = self._create_pytorch_config(max_target_length)
+    torch_policy_model = Qwen2ForCausalLM(torch_config)
+    torch_ref_model = Qwen2ForCausalLM(torch_config)
+
+    # The training hooks class will copy JAX model parameters to torch models.
+    InterceptingTrainingHooks.torch_policy_model = torch_policy_model
+    InterceptingTrainingHooks.torch_ref_model = torch_ref_model
+
+    # 2. Setup a temporary local JSON dataset containing our preference sample to test the REAL MaxText input pipeline
+    with tempfile.TemporaryDirectory() as temp_dir:
+      temp_json_path = self._create_temp_dataset(temp_dir, "dpo_dataset.json")
+
+      # Configure MaxText Hyperparameters pointing to our local JSON file
+      print("\nInitializing JAX MaxText Config...")
+      config = self._build_jax_config(
+          model_id=model_id,
+          max_target_length=max_target_length,
+          temp_json_path=temp_json_path,
+          max_prompt_len=max_prompt_len,
+          temp_dir=temp_dir,
+          extra_args=["run_name=dpo_correctness_test"],
+      )
+
+      # Run JAX DPO Native Training Loop and get flat metrics
+      jax_ref = get_jax_reference(config)
+
+    # 3. Evaluate PyTorch Reference dynamically on the synced distinct weights
+    print("Evaluating PyTorch Reference on distinct synced models...")
+    py_ref = get_pytorch_reference(
+        policy_model=torch_policy_model,
+        ref_model=torch_ref_model,
+        tokenizer=AutoTokenizer.from_pretrained(model_id),
+        prompt_str=self.COMMON_PROMPT,
+        chosen_str=self.COMMON_CHOSEN,
+        rejected_str=self.COMMON_REJECTED,
+        beta=beta,
+    )
+
+    print("\n=== Symmetrical Parity Comparison (Step 3 - Diverged weights) ===")
+    print(
+        f"PyTorch Symmetrical Chosen Logps:   {py_ref['chosen_logps']:.6f} | "
+        f"JAX Step 3: {jax_ref['chosen_logps']:.6f}"
+    )
+    print(
+        f"PyTorch Symmetrical Rejected Logps: {py_ref['rejected_logps']:.6f} | "
+        f"JAX Step 3: {jax_ref['rejected_logps']:.6f}"
+    )
+    print(f"PyTorch Ref Chosen Logps:           {py_ref['ref_chosen_logps']:.6f}")
+    print(f"PyTorch Ref Rejected Logps:         {py_ref['ref_rejected_logps']:.6f}")
+    print(f"PyTorch DPO Loss:                   {py_ref['loss']:.6f} | JAX Step 3: {jax_ref['loss']:.6f}")
+    print(f"PyTorch Reward Margin:              {py_ref['margin']:.6f} | JAX Step 3: {jax_ref['margin']:.6f}")
+    print(f"JAX train_dpo Step 1 Loss:          {jax_ref['loss_step_1']:.6f}")
+    print(f"JAX train_dpo Step 1 Margin:        {jax_ref['margin_step_1']:.6f}")
+
+    # Verify JAX policy and reference models did mutate and diverge after training steps
+    self.assertNotEqual(jax_ref["margin"], 0.0, msg="JAX policy model did not mutate and diverge after training steps!")
+
+    # Assert strict parity on raw, non-zero log probabilities at Step 3
+    # This validates JAX ref_model + policy model outputs concurrently on distinct parameters!
+    self.assertLess(
+        abs(jax_ref["chosen_logps"] - py_ref["chosen_logps"]),
+        0.5,
+        msg=(
+            "Step 3 Chosen Log probabilities diverge: "
+            f"JAX {jax_ref['chosen_logps']:.6f} vs PyTorch {py_ref['chosen_logps']:.6f}"
+        ),
+    )
+    self.assertLess(
+        abs(jax_ref["rejected_logps"] - py_ref["rejected_logps"]),
+        0.5,
+        msg=(
+            "Step 3 Rejected Log probabilities diverge: "
+            f"JAX {jax_ref['rejected_logps']:.6f} vs PyTorch {py_ref['rejected_logps']:.6f}"
+        ),
+    )
+    # Assert strict parity on non-trivial loss at Step 3 (Weights are completely diverged!)
+    self.assertLess(
+        abs(jax_ref["loss"] - py_ref["loss"]),
+        0.05,
+        msg=f"Step 3 DPO Loss diverges: JAX {jax_ref['loss']:.6f} vs PyTorch {py_ref['loss']:.6f}",
+    )
+    print("\n[INFO] Parity check succeeded with history variation under strict thresholds!")
+
+  def test_maxtext_pytorch_orpo_parity(self):
+    model_id = "Qwen/Qwen2.5-1.5B-Instruct"
+
+    max_prompt_len = 144  # We intentionally set max_prompt_len != max_sequence_length to test the padding logic.
+    max_response_len = 112
+    max_target_length = max_prompt_len + max_response_len
+    lambda_orpo = 0.1
+
+    # 1. Initialize Symmetrical PyTorch model structures and register them with test hooks
+    print("Initializing PyTorch tiny Qwen2 model...")
+    torch_config = self._create_pytorch_config(max_target_length)
+    torch_policy_model = Qwen2ForCausalLM(torch_config)
+    torch_ref_model = Qwen2ForCausalLM(torch_config)  # This represents the model weights at initialization.
+
+    # The training hooks class will copy JAX model parameters to torch models.
+    InterceptingTrainingHooks.torch_policy_model = torch_policy_model
+    InterceptingTrainingHooks.torch_ref_model = torch_ref_model
+
+    # 2. Setup a temporary local JSON dataset containing our preference sample to test the REAL MaxText input pipeline
+    with tempfile.TemporaryDirectory() as temp_dir:
+      temp_json_path = self._create_temp_dataset(temp_dir, "orpo_dataset.json")
+
+      # Configure MaxText Hyperparameters pointing to our local JSON file
+      print("\nInitializing JAX MaxText Config...")
+      config = self._build_jax_config(
+          model_id=model_id,
+          max_target_length=max_target_length,
+          temp_json_path=temp_json_path,
+          max_prompt_len=max_prompt_len,
+          temp_dir=temp_dir,
+          extra_args=[
+              "dpo.algo=orpo",
+              f"dpo.orpo_lambda={lambda_orpo}",
+              "run_name=orpo_correctness_test",
+          ],
+      )
+
+      # Run JAX ORPO Native Training Loop and get flat metrics
+      jax_ref = get_jax_reference(config)
+
+    # 3. Evaluate PyTorch Reference dynamically on the synced distinct weights
+    print("Evaluating PyTorch Reference on distinct synced models...")
+    py_ref = get_pytorch_reference(
+        policy_model=torch_policy_model,
+        ref_model=None,
+        tokenizer=AutoTokenizer.from_pretrained(model_id),
+        prompt_str=self.COMMON_PROMPT,
+        chosen_str=self.COMMON_CHOSEN,
+        rejected_str=self.COMMON_REJECTED,
+        algo="orpo",
+        lambda_orpo=lambda_orpo,
+    )
+
+    # Evaluate initial weights on the same inputs to validate the model evolved as it trains.
+    py_initial_ref = get_pytorch_reference(
+        policy_model=torch_ref_model,  # This is the initial model state synced at the beginning of the training loop.
+        ref_model=None,
+        tokenizer=AutoTokenizer.from_pretrained(model_id),
+        prompt_str=self.COMMON_PROMPT,
+        chosen_str=self.COMMON_CHOSEN,
+        rejected_str=self.COMMON_REJECTED,
+        algo="orpo",
+        lambda_orpo=lambda_orpo,
+    )
+
+    print("\n=== Symmetrical Parity Comparison (Step 3 - Diverged weights) ===")
+    print(
+        f"PyTorch Symmetrical Chosen Logps:   {py_ref['chosen_logps']:.6f} | "
+        f"JAX Step 3: {jax_ref['chosen_logps']:.6f}"
+    )
+    print(
+        f"PyTorch Symmetrical Rejected Logps: {py_ref['rejected_logps']:.6f} | "
+        f"JAX Step 3: {jax_ref['rejected_logps']:.6f}"
+    )
+    print(f"PyTorch ORPO Loss:                   {py_ref['loss']:.6f} | JAX Step 3: {jax_ref['loss']:.6f}")
+    print(f"PyTorch Reward Margin:              {py_ref['margin']:.6f} | JAX Step 3: {jax_ref['margin']:.6f}")
+    print(f"JAX train_orpo Step 1 Loss:          {jax_ref['loss_step_1']:.6f}")
+    print(f"JAX train_orpo Step 1 Margin:        {jax_ref['margin_step_1']:.6f}")
+
+    # Verify JAX policy model did mutate and update parameters compared to initial weights
+    self.assertNotEqual(
+        py_ref["chosen_logps"],
+        py_initial_ref["chosen_logps"],
+        msg="Trained policy model did not mutate away from the initial weights!",
+    )
+    self.assertNotEqual(
+        py_ref["loss"],
+        py_initial_ref["loss"],
+        msg="Trained policy model did not mutate away from the initial loss!",
+    )
+
+    # Assert strict parity on raw, non-zero log probabilities at Step 3
+    self.assertLess(
+        abs(jax_ref["chosen_logps"] - py_ref["chosen_logps"]),
+        0.5,
+        msg=(
+            "Step 3 Chosen Log probabilities diverge: "
+            f"JAX {jax_ref['chosen_logps']:.6f} vs PyTorch {py_ref['chosen_logps']:.6f}"
+        ),
+    )
+    self.assertLess(
+        abs(jax_ref["rejected_logps"] - py_ref["rejected_logps"]),
+        0.5,
+        msg=(
+            "Step 3 Rejected Log probabilities diverge: "
+            f"JAX {jax_ref['rejected_logps']:.6f} vs PyTorch {py_ref['rejected_logps']:.6f}"
+        ),
+    )
+    # Assert strict parity on non-trivial loss at Step 3 (Weights are completely diverged!)
+    self.assertLess(
+        abs(jax_ref["loss"] - py_ref["loss"]),
+        0.05,
+        msg=f"Step 3 ORPO Loss diverges: JAX {jax_ref['loss']:.6f} vs PyTorch {py_ref['loss']:.6f}",
+    )
+    print("\n[INFO] ORPO Parity check succeeded with history variation under strict thresholds!")
+
+  # ----------------------------------------------------------------------------
+  # Private Helpers for DPOTRLCorrectnessTest
+  # ----------------------------------------------------------------------------
+
+  def _create_pytorch_config(self, max_target_length: int) -> Qwen2Config:
+    """Helper to create symmetrical PyTorch tiny model configuration."""
+    return Qwen2Config(
+        vocab_size=151936,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        head_dim=32,
+        max_position_embeddings=max_target_length,
+        rms_norm_eps=1e-6,
+        rope_theta=1000000.0,
+        use_cache=False,
+    )
+
+  def _create_temp_dataset(self, temp_dir: str, filename: str) -> str:
+    """Helper to construct the temporary preference dataset and write it to JSON."""
+    # Setup a temporary local JSON dataset containing our preference sample to test the REAL MaxText input pipeline.
+    # We duplicate the sample (* 20) to provide enough contiguous batches for exactly 3 steps.
+    # We feed different inputs in Steps 1 and 2 to verify that state synchronization makes
+    # Step 3 parity immune to training history!
+    temp_json_data = [
+        {
+            "prompt": "How does gradient descent work?",
+            "chosen": (
+                "Gradient descent is an optimization algorithm that updates"
+                " parameters in the opposite direction of the gradient."
+            ),
+            "rejected": "Gradient descent is a method for climbing up hills to find local maxima.",
+        },
+        {
+            "prompt": "What is a neural network?",
+            "chosen": "A neural network is a network of interconnected nodes that learns representations from data.",
+            "rejected": "A neural network is a database designed for storing tabular data.",
+        },
+    ] + [
+        {
+            "prompt": self.COMMON_PROMPT,
+            "chosen": self.COMMON_CHOSEN,
+            "rejected": self.COMMON_REJECTED,
+        }
+    ] * 20
+
+    temp_json_path = os.path.join(temp_dir, filename)
+    with open(temp_json_path, "w", encoding="utf-8") as f:
+      json.dump(temp_json_data, f)
+    return temp_json_path
+
+  def _build_jax_config(
+      self,
+      model_id: str,
+      max_target_length: int,
+      temp_json_path: str,
+      max_prompt_len: int,
+      temp_dir: str,
+      extra_args: list[str] | None = None,
+  ) -> Any:
+    """Helper to build MaxText JAX config object common to DPO and ORPO."""
+    argv = [
+        "src/maxtext/configs/base.yml",
+        "model_name=qwen2.5-1.5b",
+        f"tokenizer_path={model_id}",
+        "scan_layers=False",
+        "attention=dot_product",
+        "per_device_batch_size=1",
+        f"max_target_length={max_target_length}",
+        "skip_jax_distributed_system=True",
+        "enable_nnx=True",
+        "pure_nnx=True",
+        "pure_nnx_decoder=False",
+        "remat_policy=full",
+        "log_config=0",
+        # Tiny architecture specifications
+        "base_emb_dim=64",
+        "head_dim=32",
+        "base_num_query_heads=2",
+        "base_num_kv_heads=2",
+        "base_mlp_dim=128",
+        "base_num_decoder_layers=2",
+        "override_model_config=True",
+        # Native input pipeline dataset specifications
+        "use_dpo=True",
+        "packing=False",
+        "dataset_type=hf",
+        "hf_path=json",
+        f"hf_train_files={temp_json_path}",
+        "tokenize_train_data=True",
+        "train_data_columns=[prompt,chosen,rejected]",
+        "eval_data_columns=[prompt,chosen,rejected]",
+        "enable_data_shuffling=False",
+        f"dpo.max_prompt_length={max_prompt_len}",
+        "steps=3",
+        f"base_output_directory={temp_dir}",
+    ]
+    if extra_args:
+      argv.extend(extra_args)
+    return pyconfig.initialize_pydantic(argv)
+
+
+# ==============================================================================
+# 2. HIGH-LEVEL MODEL EXECUTION RUNNERS
+# ==============================================================================
+# These functions isolate execution details for PyTorch and JAX models.
+# ==============================================================================
+
+
+def get_pytorch_reference(
+    policy_model,
+    ref_model,
+    tokenizer,
+    prompt_str,
+    chosen_str,
+    rejected_str,
+    beta=0.1,
+    algo="dpo",
+    lambda_orpo=0.1,
+):
+  """Computes reference chosen/rejected logps and loss in PyTorch using raw, unpadded sequences."""
   policy_model.eval()
-  ref_model.eval()
+  if ref_model is not None:
+    ref_model.eval()
 
   im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
 
@@ -103,34 +485,59 @@ def get_pytorch_reference(policy_model, ref_model, tokenizer, prompt_str, chosen
     policy_chosen_logits = policy_model(chosen_tensor).logits.float()
     policy_rejected_logits = policy_model(rejected_tensor).logits.float()
 
-    ref_chosen_logits = ref_model(chosen_tensor).logits.float()
-    ref_rejected_logits = ref_model(rejected_tensor).logits.float()
-
     policy_chosen_logps = get_batch_logps(policy_chosen_logits, chosen_tensor, chosen_mask)
     policy_rejected_logps = get_batch_logps(policy_rejected_logits, rejected_tensor, rejected_mask)
 
-    ref_chosen_logps = get_batch_logps(ref_chosen_logits, chosen_tensor, chosen_mask)
-    ref_rejected_logps = get_batch_logps(ref_rejected_logits, rejected_tensor, rejected_mask)
+    if algo == "orpo":
+      # L_SFT = -(1/|y_w|) * Σ log P
+      chosen_lengths = chosen_mask[..., 1:].sum(-1)
+      chosen_lengths = torch.clamp(chosen_lengths, min=1.0)
+      sft_loss = -policy_chosen_logps / chosen_lengths
 
-    chosen_log_ratio = policy_chosen_logps - ref_chosen_logps
-    rejected_log_ratio = policy_rejected_logps - ref_rejected_logps
+      # L_OR
+      log_odds = (policy_chosen_logps - policy_rejected_logps) - (
+          torch.log1p(-torch.exp(policy_chosen_logps)) - torch.log1p(-torch.exp(policy_rejected_logps))
+      )
+      or_loss = -F.logsigmoid(log_odds)
+      loss = sft_loss + lambda_orpo * or_loss
+      margin = lambda_orpo * policy_chosen_logps - lambda_orpo * policy_rejected_logps
 
-    delta = chosen_log_ratio - rejected_log_ratio
-    loss = -F.logsigmoid(beta * delta).mean()
-    margin = chosen_log_ratio - rejected_log_ratio
+      return {
+          "chosen_ids": chosen_ids,
+          "rejected_ids": rejected_ids,
+          "chosen_mask": chosen_labels_mask,
+          "rejected_mask": rejected_labels_mask,
+          "chosen_logps": policy_chosen_logps.item(),
+          "rejected_logps": policy_rejected_logps.item(),
+          "loss": loss.mean().item(),
+          "margin": margin.mean().item(),
+      }
+    else:
+      ref_chosen_logits = ref_model(chosen_tensor).logits.float()
+      ref_rejected_logits = ref_model(rejected_tensor).logits.float()
 
-  return {
-      "chosen_ids": chosen_ids,
-      "rejected_ids": rejected_ids,
-      "chosen_mask": chosen_labels_mask,
-      "rejected_mask": rejected_labels_mask,
-      "chosen_logps": policy_chosen_logps.item(),
-      "rejected_logps": policy_rejected_logps.item(),
-      "ref_chosen_logps": ref_chosen_logps.item(),
-      "ref_rejected_logps": ref_rejected_logps.item(),
-      "loss": loss.item(),
-      "margin": margin.item(),
-  }
+      ref_chosen_logps = get_batch_logps(ref_chosen_logits, chosen_tensor, chosen_mask)
+      ref_rejected_logps = get_batch_logps(ref_rejected_logits, rejected_tensor, rejected_mask)
+
+      chosen_log_ratio = policy_chosen_logps - ref_chosen_logps
+      rejected_log_ratio = policy_rejected_logps - ref_rejected_logps
+
+      delta = chosen_log_ratio - rejected_log_ratio
+      loss = -F.logsigmoid(beta * delta).mean()
+      margin = chosen_log_ratio - rejected_log_ratio
+
+      return {
+          "chosen_ids": chosen_ids,
+          "rejected_ids": rejected_ids,
+          "chosen_mask": chosen_labels_mask,
+          "rejected_mask": rejected_labels_mask,
+          "chosen_logps": policy_chosen_logps.item(),
+          "rejected_logps": policy_rejected_logps.item(),
+          "ref_chosen_logps": ref_chosen_logps.item(),
+          "ref_rejected_logps": ref_rejected_logps.item(),
+          "loss": loss.item(),
+          "margin": margin.item(),
+      }
 
 
 def get_jax_reference(config):
@@ -153,6 +560,59 @@ def get_jax_reference(config):
       "chosen_logps": step_3["chosen_logps"],
       "rejected_logps": step_3["rejected_logps"],
   }
+
+
+# ==============================================================================
+# 3. LOW-LEVEL STATE INTERCEPTION & WEIGHT SYNCHRONIZATION
+# ==============================================================================
+# These classes and functions manage mechanical state syncing between JAX and PyTorch.
+# ==============================================================================
+
+# Store original hook class for clean cleanup
+_original_training_hooks = dpo_hooks.DPOTrainingHooks
+
+
+class InterceptingTrainingHooks(_original_training_hooks):
+  """Custom training hooks class to intercept loss and rewards margin during real trainer step execution."""
+
+  captured_metrics = []
+  last_batch = None
+  torch_policy_model = None
+  torch_ref_model = None
+
+  def on_train_step_start(self, train_ctx):
+    super().on_train_step_start(train_ctx)
+    InterceptingTrainingHooks.last_batch = train_ctx.data_hooks.train_batch
+    if train_ctx.train_steps == 0 and InterceptingTrainingHooks.torch_ref_model is not None:
+      if train_ctx.ref_model is not None:
+        # DPO mode: sync the reference model on step 1. It's supposed to be frozen, the test would fail if it is drifting.
+        sync_jax_to_pytorch(train_ctx.ref_model, InterceptingTrainingHooks.torch_ref_model)
+      else:
+        # ORPO mode: sync the initial policy model state on step 1 to validate that the model evolves as it trains.
+        sync_jax_to_pytorch(train_ctx.model, InterceptingTrainingHooks.torch_ref_model)
+
+    # Sync the trained policy model on step 3 for logits comparison against Pytorch.
+    if train_ctx.train_steps == 2:
+      sync_jax_to_pytorch(train_ctx.model, InterceptingTrainingHooks.torch_policy_model)
+
+  def on_train_step_end(self, train_ctx, train_step, train_loss, step_time=0.0):
+    super().on_train_step_end(train_ctx, train_step, train_loss, step_time)
+
+    prefix = train_ctx.metrics_prefix
+    accuracy = float(train_ctx.metrics_logger.get_metric_history(prefix, "rewards/accuracy", "train")[-1])
+    margin = float(train_ctx.metrics_logger.get_metric_history(prefix, "rewards/margin", "train")[-1])
+    chosen_logps = float(train_ctx.metrics_logger.get_metric_history(prefix, "log_probs/chosen", "train")[-1])
+    rejected_logps = float(train_ctx.metrics_logger.get_metric_history(prefix, "log_probs/rejected", "train")[-1])
+
+    self.captured_metrics.append(
+        {
+            "loss": float(train_loss),
+            "accuracy": accuracy,
+            "margin": margin,
+            "chosen_logps": chosen_logps,
+            "rejected_logps": rejected_logps,
+        }
+    )
 
 
 def sync_jax_to_pytorch(jax_model, torch_model):
@@ -252,244 +712,6 @@ def sync_jax_to_pytorch(jax_model, torch_model):
   sync_param("lm_head.weight", ("base", "token_embedder", "embedding"))
 
   torch_model.load_state_dict(torch_state_dict)
-
-
-# Store original hook class for clean cleanup
-_original_training_hooks = dpo_hooks.DPOTrainingHooks
-
-
-class InterceptingTrainingHooks(_original_training_hooks):
-  """Custom training hooks class to intercept loss and rewards margin during real trainer step execution."""
-
-  captured_metrics = []
-  last_batch = None
-  torch_policy_model = None
-  torch_ref_model = None
-
-  def on_train_step_start(self, train_ctx):
-    super().on_train_step_start(train_ctx)
-    InterceptingTrainingHooks.last_batch = train_ctx.data_hooks.train_batch
-    # Sync the reference model on step 1. It's supposed to be frozen, the test would fail if it is drifting.
-    if train_ctx.train_steps == 0:
-      sync_jax_to_pytorch(train_ctx.ref_model, InterceptingTrainingHooks.torch_ref_model)
-
-    # Sync the trained policy model on step 3 for logits comparison against Pytorch.
-    if train_ctx.train_steps == 2:
-      sync_jax_to_pytorch(train_ctx.model, InterceptingTrainingHooks.torch_policy_model)
-
-  def on_train_step_end(self, train_ctx, train_step, train_loss, step_time=0.0):
-    super().on_train_step_end(train_ctx, train_step, train_loss, step_time)
-
-    prefix = train_ctx.metrics_prefix
-    accuracy = float(train_ctx.metrics_logger.get_metric_history(prefix, "rewards/accuracy", "train")[-1])
-    margin = float(train_ctx.metrics_logger.get_metric_history(prefix, "rewards/margin", "train")[-1])
-    chosen_logps = float(train_ctx.metrics_logger.get_metric_history(prefix, "log_probs/chosen", "train")[-1])
-    rejected_logps = float(train_ctx.metrics_logger.get_metric_history(prefix, "log_probs/rejected", "train")[-1])
-
-    self.captured_metrics.append(
-        {
-            "loss": float(train_loss),
-            "accuracy": accuracy,
-            "margin": margin,
-            "chosen_logps": chosen_logps,
-            "rejected_logps": rejected_logps,
-        }
-    )
-
-
-class DPOTRLCorrectnessTest(unittest.TestCase):
-
-  @classmethod
-  def setUpClass(cls):
-    # Set JAX default platform to CPU to eliminate CPU/TPU accelerator math variations
-    jax.config.update("jax_platforms", "cpu")
-    # Set JAX to CPU/TPU PRNG and SPMD defaults
-    jax.config.update("jax_default_prng_impl", "unsafe_rbg")
-    if "xla_tpu_spmd_rng_bit_generator_unsafe" not in os.environ.get("LIBTPU_INIT_ARGS", ""):
-      os.environ["LIBTPU_INIT_ARGS"] = (
-          os.environ.get("LIBTPU_INIT_ARGS", "") + " --xla_tpu_spmd_rng_bit_generator_unsafe=true"
-      )
-
-    # Monkeypatch the training hooks class dynamically
-    dpo_hooks.DPOTrainingHooks = InterceptingTrainingHooks
-
-  @classmethod
-  def tearDownClass(cls):
-    # Restore original hooks to prevent polluting other tests
-    dpo_hooks.DPOTrainingHooks = _original_training_hooks
-    # Clear class variables
-    InterceptingTrainingHooks.captured_metrics = []
-    InterceptingTrainingHooks.last_batch = None
-    InterceptingTrainingHooks.torch_policy_model = None
-    InterceptingTrainingHooks.torch_ref_model = None
-
-  def test_maxtext_pytorch_dpo_parity(self):
-    model_id = "Qwen/Qwen2.5-1.5B-Instruct"
-
-    prompt_str = "What is DPO?"
-    chosen_str = "DPO stands for Direct Preference Optimization, an algorithm for aligning LLMs."
-    rejected_str = "DPO is a marketing strategy used to target customers' preferences."
-    max_prompt_len = 144  # We intentionally set max_prompt_len != max_sequence_length to test the padding logic.
-    max_response_len = 112
-    max_target_length = max_prompt_len + max_response_len
-    beta = 0.1
-
-    # 1. Initialize Symmetrical PyTorch model structures and register them with test hooks
-    print("Initializing PyTorch tiny Qwen2 model...")
-    torch_config = Qwen2Config(
-        vocab_size=151936,
-        hidden_size=64,
-        intermediate_size=128,
-        num_hidden_layers=2,
-        num_attention_heads=2,
-        num_key_value_heads=2,
-        head_dim=32,
-        max_position_embeddings=max_target_length,
-        rms_norm_eps=1e-6,
-        rope_theta=1000000.0,
-        use_cache=False,
-    )
-    torch_policy_model = Qwen2ForCausalLM(torch_config)
-    torch_ref_model = Qwen2ForCausalLM(torch_config)
-
-    # The training hooks class will copy JAX model parameters to torch models.
-    InterceptingTrainingHooks.torch_policy_model = torch_policy_model
-    InterceptingTrainingHooks.torch_ref_model = torch_ref_model
-
-    # 2. Setup a temporary local JSON dataset containing our DPO sample to test the REAL MaxText input pipeline
-    # We duplicate the sample to provide enough contiguous batches for exactly 3 steps
-    # We feed different inputs in Steps 1 and 2 to verify that state synchronization makes
-    # Step 3 parity immune to training history!
-    #
-    # NOTE: We append 20 copies of the Step 3 item. The tf.data input pipeline prefetches
-    # elements eagerly using AUTOTUNE (scaling with CPU cores). On high-resource CI agents,
-    # a small dataset would trigger premature OutOfRange/StopIteration iterator exhaustion.
-    # Appending 20 copies completely isolates the test from prefetch/exhaustion flakiness.
-    temp_json_data = [
-        {
-            "prompt": "How does gradient descent work?",
-            "chosen": (
-                "Gradient descent is an optimization algorithm that updates"
-                " parameters in the opposite direction of the gradient."
-            ),
-            "rejected": "Gradient descent is a method for climbing up hills to find local maxima.",
-        },
-        {
-            "prompt": "What is a neural network?",
-            "chosen": "A neural network is a network of interconnected nodes that learns representations from data.",
-            "rejected": "A neural network is a database designed for storing tabular data.",
-        },
-    ] + [
-        {
-            "prompt": prompt_str,
-            "chosen": chosen_str,
-            "rejected": rejected_str,
-        }
-    ] * 20
-
-    with tempfile.TemporaryDirectory() as temp_dir:
-      temp_json_path = os.path.join(temp_dir, "captured_dpo_sample.json")
-      with open(temp_json_path, "w", encoding="utf-8") as f:
-        json.dump(temp_json_data, f)
-
-      # Configure MaxText Hyperparameters pointing to our local JSON file
-      print("\nInitializing JAX MaxText Config...")
-      argv = [
-          "src/maxtext/configs/base.yml",
-          "model_name=qwen2.5-1.5b",
-          f"tokenizer_path={model_id}",
-          "scan_layers=False",
-          "attention=dot_product",
-          "per_device_batch_size=1",
-          f"max_target_length={max_target_length}",
-          "skip_jax_distributed_system=True",
-          "enable_nnx=True",
-          "pure_nnx=True",
-          "pure_nnx_decoder=False",
-          "remat_policy=full",
-          "log_config=0",
-          # Tiny architecture specifications
-          "base_emb_dim=64",
-          "head_dim=32",
-          "base_num_query_heads=2",
-          "base_num_kv_heads=2",
-          "base_mlp_dim=128",
-          "base_num_decoder_layers=2",
-          "override_model_config=True",
-          # Native input pipeline dataset specifications
-          "use_dpo=True",
-          "packing=False",
-          "dataset_type=hf",
-          "hf_path=json",
-          f"hf_train_files={temp_json_path}",
-          "tokenize_train_data=True",
-          "train_data_columns=[prompt,chosen,rejected]",
-          "eval_data_columns=[prompt,chosen,rejected]",
-          "enable_data_shuffling=False",
-          f"dpo.max_prompt_length={max_prompt_len}",
-          "steps=3",
-      ]
-      config = pyconfig.initialize_pydantic(argv)
-
-      # Run JAX DPO Native Training Loop and get flat metrics
-      jax_ref = get_jax_reference(config)
-
-    # 3. Evaluate PyTorch Reference dynamically on the synced distinct weights
-    print("Evaluating PyTorch Reference on distinct synced models...")
-    py_ref = get_pytorch_reference(
-        policy_model=torch_policy_model,
-        ref_model=torch_ref_model,
-        tokenizer=AutoTokenizer.from_pretrained(model_id),
-        prompt_str=prompt_str,
-        chosen_str=chosen_str,
-        rejected_str=rejected_str,
-        beta=beta,
-    )
-
-    print("\n=== Symmetrical Parity Comparison (Step 3 - Diverged weights) ===")
-    print(
-        f"PyTorch Symmetrical Chosen Logps:   {py_ref['chosen_logps']:.6f} | "
-        f"JAX Step 3: {jax_ref['chosen_logps']:.6f}"
-    )
-    print(
-        f"PyTorch Symmetrical Rejected Logps: {py_ref['rejected_logps']:.6f} | "
-        f"JAX Step 3: {jax_ref['rejected_logps']:.6f}"
-    )
-    print(f"PyTorch Ref Chosen Logps:           {py_ref['ref_chosen_logps']:.6f}")
-    print(f"PyTorch Ref Rejected Logps:         {py_ref['ref_rejected_logps']:.6f}")
-    print(f"PyTorch DPO Loss:                   {py_ref['loss']:.6f} | JAX Step 3: {jax_ref['loss']:.6f}")
-    print(f"PyTorch Reward Margin:              {py_ref['margin']:.6f} | JAX Step 3: {jax_ref['margin']:.6f}")
-    print(f"JAX train_dpo Step 1 Loss:          {jax_ref['loss_step_1']:.6f}")
-    print(f"JAX train_dpo Step 1 Margin:        {jax_ref['margin_step_1']:.6f}")
-
-    # Verify JAX policy and reference models did mutate and diverge after training steps
-    self.assertNotEqual(jax_ref["margin"], 0.0, msg="JAX policy model did not mutate and diverge after training steps!")
-
-    # Assert strict parity on raw, non-zero log probabilities at Step 3
-    # This validates JAX ref_model + policy model outputs concurrently on distinct parameters!
-    self.assertLess(
-        abs(jax_ref["chosen_logps"] - py_ref["chosen_logps"]),
-        0.5,
-        msg=(
-            "Step 3 Chosen Log probabilities diverge: "
-            f"JAX {jax_ref['chosen_logps']:.6f} vs PyTorch {py_ref['chosen_logps']:.6f}"
-        ),
-    )
-    self.assertLess(
-        abs(jax_ref["rejected_logps"] - py_ref["rejected_logps"]),
-        0.5,
-        msg=(
-            "Step 3 Rejected Log probabilities diverge: "
-            f"JAX {jax_ref['rejected_logps']:.6f} vs PyTorch {py_ref['rejected_logps']:.6f}"
-        ),
-    )
-    # Assert strict parity on non-trivial loss at Step 3 (Weights are completely diverged!)
-    self.assertLess(
-        abs(jax_ref["loss"] - py_ref["loss"]),
-        0.05,
-        msg=f"Step 3 DPO Loss diverges: JAX {jax_ref['loss']:.6f} vs PyTorch {py_ref['loss']:.6f}",
-    )
-    print("\n[INFO] Parity check succeeded with history variation under strict thresholds!")
 
 
 if __name__ == "__main__":
