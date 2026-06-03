@@ -1136,12 +1136,12 @@ class Decoder(nn.Module):
             if cfg.decoder_block in (DecoderBlockType.QWEN3_NEXT, DecoderBlockType.QWEN3_5):
               layer_kwargs = {"layer_idx": lyr}
             kv_cache = None
-            if kv_caches is not None and cfg.decoder_block not in (DecoderBlockType.QWEN3_NEXT, DecoderBlockType.QWEN3_5):
+            if kv_caches is not None:
+              # For all decoder blocks (including QWEN3_NEXT/QWEN3_5 with vLLM flat-list
+              # kv_caches), pass the per-layer cache directly. For hybrid attention+GDN
+              # models, kv_caches[lyr] is a regular attention cache for attention layers
+              # and a (conv_state, recurrent_state) paged-mamba tuple for GDN layers.
               kv_cache = kv_caches[lyr]
-            elif kv_caches is not None and cfg.decoder_block in (DecoderBlockType.QWEN3_NEXT, DecoderBlockType.QWEN3_5):
-              # For Qwen3Next & Qwen3.5, kv_caches is a dictionary of lists of caches.
-              if (lyr + 1) % cfg.inhomogeneous_layer_cycle_interval == 0:
-                kv_cache = (kv_caches["key_cache"][lyr], kv_caches["value_cache"][lyr])
 
             if cfg.decoder_block == DecoderBlockType.GPT_OSS:
               layer_kwargs = {"attention_type": gpt_oss.get_attention_type(layer_id=lyr)}
@@ -1163,11 +1163,7 @@ class Decoder(nn.Module):
                 **layer_call_kwargs,
             )
             if kv_caches is not None and returned_cache is not None:
-              if cfg.decoder_block not in (DecoderBlockType.QWEN3_NEXT, DecoderBlockType.QWEN3_5):
-                kv_caches[lyr] = returned_cache
-              elif (lyr + 1) % cfg.inhomogeneous_layer_cycle_interval == 0:
-                kv_caches["key_cache"][lyr] = returned_cache[0]
-                kv_caches["value_cache"][lyr] = returned_cache[1]
+              kv_caches[lyr] = returned_cache
 
             if deepstack_visual_embeds is not None and lyr < len(deepstack_visual_embeds):
               visual_embeds = deepstack_visual_embeds[lyr]

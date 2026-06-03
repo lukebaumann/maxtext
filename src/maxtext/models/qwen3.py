@@ -16,8 +16,10 @@
 # pylint: disable=arguments-differ
 # pylint: disable=no-name-in-module
 
+import functools
 from typing import Any, cast
 import math
+import os
 
 import jax
 import jax.nn
@@ -30,6 +32,8 @@ from flax import linen as nn
 from flax import nnx
 
 from maxtext.common.common_types import AttentionType, Config, DType, Array, BATCH, EMBED, MODEL_MODE_TRAIN, LENGTH
+from maxtext.common.common_types import KV_BATCH, KV_HEAD
+from maxtext.utils.sharding import logical_to_mesh_axes
 from maxtext.layers import attentions
 from maxtext.layers import initializers as max_initializers
 from maxtext.layers import moe
@@ -381,13 +385,25 @@ class Qwen3NextGatedDeltaNet(nnx.Module):
   2. output = Linear_out(y)
   """
 
-  def __init__(self, config: Config, dtype: DType = jnp.float32, model_mode: str = MODEL_MODE_TRAIN, *, rngs: nnx.Rngs):
+  def __init__(
+      self,
+      config: Config,
+      mesh=None,
+      dtype: DType = jnp.float32,
+      model_mode: str = MODEL_MODE_TRAIN,
+      *,
+      rngs: nnx.Rngs,
+  ):
     """
     Args:
       config: MaxText configuration object.
+      mesh: Optional JAX device mesh (required for vLLM paged-state path).
       rngs: The random number generators for initialization, passed by the nnx.to_linen wrapper.
     """
     self.config = config
+    self.mesh = mesh
+
+    self._gdn_replicate_expert = os.environ.get("MAXTEXT_GDN_REPLICATE_EXPERT", "False").lower() == "true"
     cfg = self.config
 
     in_features = cfg.emb_dim
@@ -418,7 +434,7 @@ class Qwen3NextGatedDeltaNet(nnx.Module):
         out_features_shape=(self.key_dim * 2 + self.value_dim * 2),
         dtype=cfg.dtype,
         weight_dtype=cfg.weight_dtype,
-        kernel_axes=("embed", "mlp"),
+        kernel_axes=("embed", "gdn_head"),
         matmul_precision=cfg.matmul_precision,
         rngs=rngs,
     )
@@ -427,7 +443,7 @@ class Qwen3NextGatedDeltaNet(nnx.Module):
         out_features_shape=(self.num_v_heads * 2),
         dtype=cfg.dtype,
         weight_dtype=cfg.weight_dtype,
-        kernel_axes=("embed", "mlp"),
+        kernel_axes=("embed", "gdn_head"),
         matmul_precision=cfg.matmul_precision,
         rngs=rngs,
     )
@@ -466,7 +482,7 @@ class Qwen3NextGatedDeltaNet(nnx.Module):
         out_features_shape=(in_features,),
         dtype=cfg.dtype,
         weight_dtype=cfg.weight_dtype,
-        kernel_axes=("mlp", "embed"),
+        kernel_axes=("gdn_head", "embed"),
         matmul_precision=cfg.matmul_precision,
         rngs=rngs,
     )
@@ -477,11 +493,23 @@ class Qwen3NextGatedDeltaNet(nnx.Module):
       model_mode: str = MODEL_MODE_TRAIN,
       kv_cache=None,
       decoder_segment_ids: None | Array = None,
+      attention_metadata=None,
       **kwargs,
-  ) -> Array:
+  ) -> tuple[Array, tuple | None]:
     # hidden_states: (B, S, E)
     cfg = self.config
     batch, seq_len, _ = hidden_states.shape
+
+    # When kv_cache is a 2-tuple of paged mamba state arrays from vLLM, use
+    # run_jax_gdn_attention from tpu_inference for correct sequential token processing.
+    use_paged_state = (
+        kv_cache is not None
+        and isinstance(kv_cache, tuple)
+        and len(kv_cache) == 2
+        and attention_metadata is not None
+        and getattr(attention_metadata, "mamba_state_indices", None) is not None
+        and self.mesh is not None
+    )
 
     # =========================================================================
     # STEP A: Input Projections
@@ -491,7 +519,9 @@ class Qwen3NextGatedDeltaNet(nnx.Module):
     # ba: (B, S, 2 * H_v)
     ba = self.in_proj_ba(hidden_states)
 
-    # QKVZ Reshaping and Splitting
+    # =========================================================================
+    # QKVZ and BA Reshaping and Splitting (shared by both paths)
+    # =========================================================================
     # Per-K_head group dim: 2 * D_k + 2 * D_v * V_per_K
     new_shape_qkvz = (
         batch,
@@ -501,6 +531,11 @@ class Qwen3NextGatedDeltaNet(nnx.Module):
     )
     # mixed_qkvz: (B, S, H_k, 2*D_k + 2*D_v*V_per_K)
     mixed_qkvz = qkvz.reshape(new_shape_qkvz)
+    if self.mesh is not None:
+      logical_rules = None if self.config.using_pipeline_parallelism else self.config.logical_axis_rules
+      qkvz_pspec = logical_to_mesh_axes((KV_BATCH, None, KV_HEAD, None), mesh=self.mesh, rules=logical_rules)
+      qkvz_sharding = jax.sharding.NamedSharding(self.mesh, qkvz_pspec)
+      mixed_qkvz = jax.lax.with_sharding_constraint(mixed_qkvz, qkvz_sharding)
 
     split_indices_qkvz = [
         self.head_k_dim,  # D_k
@@ -538,6 +573,92 @@ class Qwen3NextGatedDeltaNet(nnx.Module):
     # a: (B, S, H_v)
     a = a_raw.reshape(batch, seq_len, self.num_v_heads)
 
+    if use_paged_state:
+      # =========================================================================
+      # vLLM PAGED STATE PATH: use tpu_inference fused conv + ragged delta-rule.
+      # =========================================================================
+      try:
+        # pylint: disable=import-outside-toplevel
+        # pytype: disable=import-error
+        from tpu_inference.layers.common.gdn_attention import GdnAttentionConfig, run_jax_gdn_attention  # pylint: disable=import-outside-toplevel
+        from tpu_inference.layers.common.ragged_gated_delta_rule_wrapper import RaggedGatedDeltaRuleImpl  # pylint: disable=import-outside-toplevel
+        from tpu_inference.layers.common.sharding import ShardingAxisName  # pylint: disable=import-outside-toplevel
+        from tpu_inference.layers.common.utils import reorder_concatenated_tensor_for_sharding  # pylint: disable=import-outside-toplevel
+        from tpu_inference.utils import get_mesh_shape_product  # pylint: disable=import-outside-toplevel
+        from jax.sharding import PartitionSpec as P_spec  # pylint: disable=import-outside-toplevel
+      except ImportError as e:
+        raise ImportError(
+            "GDN attention kernel require the vllm-tpu package. Please install it with `pip install vllm-tpu`."
+        ) from e
+
+      attn_data = ShardingAxisName.ATTN_DATA
+      # Head axis for the GDN kernel + the producer-side reshapes. Default ATTN_HEAD
+      # (model*expert); the experimental MAXTEXT_GDN_REPLICATE_EXPERT path uses 'model' only
+      # so GDN replicates over the expert axis (no expert-axis transpose all-to-all).
+      attn_head = ShardingAxisName.MODEL if self._gdn_replicate_expert else ShardingAxisName.ATTN_HEAD
+      tp_size = get_mesh_shape_product(self.mesh, attn_head)
+      num_tokens = batch * seq_len
+
+      # Build mixed_qkv in the kernel's per-shard layout via shard_map concatenation.
+      # Each TP shard already holds its local q/k/v head slices → concatenate locally
+      # to get [q_local | k_local | v_local] with no cross-device communication.
+      q_flat = query.reshape(num_tokens, self.key_dim)  # (T, key_dim) sharded on ATTN_HEAD
+      k_flat = key.reshape(num_tokens, self.key_dim)
+      v_flat = value_raw.reshape(num_tokens, self.value_dim)  # (T, value_dim) sharded on ATTN_HEAD
+      mixed_qkv = jax.shard_map(
+          lambda q, k, v: jnp.concatenate([q, k, v], axis=-1),
+          mesh=self.mesh,
+          in_specs=(P_spec(attn_data, attn_head),) * 3,
+          out_specs=P_spec(attn_data, attn_head),
+          check_vma=False,
+      )(q_flat, k_flat, v_flat)
+
+      b_flat = b.reshape(num_tokens, self.num_v_heads)
+      a_flat = a.reshape(num_tokens, self.num_v_heads)
+
+      # Conv weight: transpose from (kernel_size, 1, conv_dim) → (conv_dim, 1, kernel_size),
+      # then reorder so each TP shard gets its local [q_local | k_local | v_local] channels.
+      conv_weight = jnp.transpose(self.conv1d.kernel.value, (2, 1, 0))
+      conv_weight = reorder_concatenated_tensor_for_sharding(
+          conv_weight, [self.key_dim, self.key_dim, self.value_dim], tp_size, 0
+      )
+
+      conv_state_paged, recurrent_state_paged = kv_cache
+
+      # Use REF impl (pure JAX) to avoid Mosaic kernel compilation issues.
+      gdn_config = GdnAttentionConfig(ragged_gated_delta_rule_impl=RaggedGatedDeltaRuleImpl.REF)
+
+      (new_conv_state_paged, new_recurrent_state_paged), gdn_output = run_jax_gdn_attention(
+          mixed_qkv,
+          b_flat,
+          a_flat,
+          conv_state_paged,
+          recurrent_state_paged,
+          conv_weight,
+          None,  # conv_bias: MaxText conv1d uses use_bias=False.
+          jnp.asarray(self.A_log[...], dtype=cfg.dtype),
+          jnp.asarray(self.dt_bias[...], dtype=cfg.dtype),
+          attention_metadata.mamba_state_indices.astype(jnp.int32),
+          attention_metadata.query_start_loc,
+          attention_metadata.request_distribution,
+          attention_metadata.seq_lens,
+          self.num_k_heads,
+          self.num_v_heads,
+          self.head_k_dim,
+          self.head_v_dim,
+          cfg.gdn_conv_kernel_dim,
+          mesh=self.mesh,
+          config=gdn_config,
+      )
+
+      # Reshape GDN output and apply gated norm + out projection.
+      gdn_output = gdn_output.reshape(batch, seq_len, self.num_v_heads, self.head_v_dim)
+      gated_output = self.norm(gdn_output, z)
+      gated_output = gated_output.reshape(batch, seq_len, -1)
+      output = self.out_proj(gated_output)
+
+      return output, (new_conv_state_paged, new_recurrent_state_paged)
+
     # Flatten head dimensions for concatenation before conv
     # q: (B, S, K_dim)
     q = query.reshape(batch, seq_len, -1)
@@ -561,6 +682,10 @@ class Qwen3NextGatedDeltaNet(nnx.Module):
         # Assumes zero-initialized state for testing
         if conv_state.shape[0] == 1:
           conv_state = jnp.broadcast_to(conv_state, (batch,) + conv_state.shape[1:])
+        elif conv_state.shape[0] < batch:
+          padding_shape = (batch - conv_state.shape[0],) + conv_state.shape[1:]
+          padding = jnp.zeros(padding_shape, dtype=conv_state.dtype)
+          conv_state = jnp.concatenate([conv_state, padding], axis=0)
         else:
           conv_state = conv_state[:batch]
 
@@ -628,26 +753,74 @@ class Qwen3NextGatedDeltaNet(nnx.Module):
 
     recurrent_state = None
     if model_mode != MODEL_MODE_TRAIN:
-      # Retrieve state from self.cache
+      # Internal nnx.Cache path.
       recurrent_state = self.cache.recurrent_state[...]
-
       if recurrent_state.shape[0] != batch:
         if recurrent_state.shape[0] == 1:
           recurrent_state = jnp.broadcast_to(recurrent_state, (batch,) + recurrent_state.shape[1:])
+        elif recurrent_state.shape[0] < batch:
+          padding_shape = (batch - recurrent_state.shape[0],) + recurrent_state.shape[1:]
+          padding = jnp.zeros(padding_shape, dtype=recurrent_state.dtype)
+          recurrent_state = jnp.concatenate([recurrent_state, padding], axis=0)
         else:
           recurrent_state = recurrent_state[:batch]
 
-    core_attn_out, recurrent_state_out = jax_chunk_gated_delta_rule(
-        query,
-        key,
-        value,
-        g,
-        beta,
-        chunk_size=cfg.gdn_chunk_size,
-        initial_state=recurrent_state,
-        use_qk_norm_in_gdn=cfg.use_qk_norm_in_gdn,
-        compute_dtype=cfg.dtype,
-    )
+    logical_rules = self.config.logical_axis_rules
+
+    if recurrent_state is None:
+      dummy_state = jnp.zeros((batch, self.num_v_heads, self.head_k_dim, self.head_v_dim), dtype=cfg.dtype)
+      recurrent_state_arg = dummy_state
+    else:
+      recurrent_state_arg = recurrent_state
+
+    if self.mesh is not None:
+      qkv_pspec = logical_to_mesh_axes((KV_BATCH, None, KV_HEAD, None), mesh=self.mesh, rules=logical_rules)
+      g_beta_pspec = logical_to_mesh_axes((KV_BATCH, None, KV_HEAD), mesh=self.mesh, rules=logical_rules)
+      state_pspec = logical_to_mesh_axes((KV_BATCH, KV_HEAD, None, None), mesh=self.mesh, rules=logical_rules)
+
+      @functools.partial(
+          jax.shard_map,
+          mesh=self.mesh,
+          in_specs=(
+              qkv_pspec,  # query
+              qkv_pspec,  # key
+              qkv_pspec,  # value
+              g_beta_pspec,  # g
+              g_beta_pspec,  # beta
+              state_pspec,  # initial_state
+          ),
+          out_specs=(
+              qkv_pspec,  # core_attn_out
+              state_pspec,  # final_state
+          ),
+          check_vma=False,
+      )
+      def shard_mapped_delta_rule(q, k, v, g_val, beta_val, init_h):
+        return jax_chunk_gated_delta_rule(
+            query=q,
+            key=k,
+            value=v,
+            g=g_val,
+            beta=beta_val,
+            chunk_size=cfg.gdn_chunk_size,
+            initial_state=init_h,
+            use_qk_norm_in_gdn=cfg.use_qk_norm_in_gdn,
+            compute_dtype=cfg.dtype,
+        )
+
+      core_attn_out, recurrent_state_out = shard_mapped_delta_rule(query, key, value, g, beta, recurrent_state_arg)
+    else:
+      core_attn_out, recurrent_state_out = jax_chunk_gated_delta_rule(
+          query=query,
+          key=key,
+          value=value,
+          g=g,
+          beta=beta,
+          chunk_size=cfg.gdn_chunk_size,
+          initial_state=recurrent_state_arg,
+          use_qk_norm_in_gdn=cfg.use_qk_norm_in_gdn,
+          compute_dtype=cfg.dtype,
+      )
 
     if model_mode != MODEL_MODE_TRAIN:
       # Update self.cache in place for both prefill and decode
@@ -669,7 +842,7 @@ class Qwen3NextGatedDeltaNet(nnx.Module):
     # Final output shape: (B, S, E)
     output = self.out_proj(gated_output)
 
-    return output
+    return output, None
 
 
 class Qwen3NextFullAttention(nnx.Module):
@@ -986,7 +1159,9 @@ class Qwen3NextDecoderLayer(nnx.Module):
           rngs=rngs,
       )
     else:
-      self.attention = Qwen3NextGatedDeltaNet(config=cfg, dtype=cfg.dtype, model_mode=model_mode, rngs=rngs)
+      self.attention = Qwen3NextGatedDeltaNet(
+          config=cfg, mesh=self.mesh, dtype=cfg.dtype, model_mode=model_mode, rngs=rngs
+      )
 
     # Second LayerNorm, applied before the MoE block.
     self.post_attention_layernorm = Qwen3NextRMSNorm(
@@ -1033,13 +1208,13 @@ class Qwen3NextDecoderLayer(nnx.Module):
           attention_metadata=attention_metadata,
       )
     else:
-      attention_output = cast(Qwen3NextGatedDeltaNet, self.attention)(
+      attention_output, new_kv_cache = cast(Qwen3NextGatedDeltaNet, self.attention)(
           hidden_states,
           model_mode=model_mode,
-          kv_cache=None,
+          kv_cache=kv_cache,
           decoder_segment_ids=decoder_segment_ids,
+          attention_metadata=attention_metadata,
       )
-      new_kv_cache = None
 
     # First residual connection after attention
     hidden_states = residual + attention_output

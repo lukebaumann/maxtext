@@ -966,8 +966,10 @@ def from_pretrained(
           restore_args = {"base": restore_args} if has_base_key else restore_args
 
         # Free memory used by initial sharded_state before restore, to make room for the incoming checkpoint arrays.
+        # Skip nnx.Cache variables — they hold runtime state (e.g. GDN conv/recurrent state) that is
+        # not present in the checkpoint and must remain valid after the restore.
         def _free_device_memory(node):
-          if isinstance(node, nnx.Variable) and not isinstance(node, nnx.RngState):
+          if isinstance(node, nnx.Variable) and not isinstance(node, (nnx.RngState, nnx.Cache)):
             val = node[...]
           else:
             val = node
