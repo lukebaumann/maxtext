@@ -534,7 +534,10 @@ def get_nnx_create_model_fn(config, mesh=None, devices=None, model_mode=MODEL_MO
 
   def _create_model():
     rngs = maxtext_utils_nnx.create_nnx_rngs(config, model_mode=model_mode, rng_key=rng_key)
-    return from_config(config, devices, mesh, rngs=rngs, model_mode=model_mode)
+    model = from_config(config, devices, mesh, rngs=rngs, model_mode=model_mode)
+    if config.pure_nnx:
+      _ = nnx.pop(model, nnx.Intermediate)
+    return model
 
   return _create_model
 
@@ -563,8 +566,13 @@ def create_nnx_abstract_model(
       abs_model = nnx.eval_shape(_create_model)
     graphdef, abs_var_state = nnx.split(abs_model)
     named_sharding_state = maxtext_utils.get_nnx_named_sharding_with_scan_axis(abs_var_state, mesh)
+
+    def _create_struct(a, s):
+      s = s if isinstance(s, jax.sharding.Sharding) else getattr(s, "sharding", None)
+      return jax.ShapeDtypeStruct(a.shape, a.dtype, sharding=s)
+
     abstract_state = jax.tree.map(
-        lambda a, s: jax.ShapeDtypeStruct(a.shape, a.dtype, sharding=s),
+        _create_struct,
         abs_var_state,
         named_sharding_state,
     )
