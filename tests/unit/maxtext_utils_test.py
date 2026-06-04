@@ -1503,6 +1503,7 @@ class TestNNXAbstractState(unittest.TestCase):
     optimizer_memory_host_offload: bool = False
     parameter_memory_host_offload: bool = False
     param_scan_axis: int = 0
+    remove_size_one_mesh_axis_from_type: bool = True
     logical_axis_rules: list = field(default_factory=lambda: [["data", ["data"]]])
 
   class MockTrainState(nnx.Module):
