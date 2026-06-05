@@ -835,7 +835,7 @@ def train_loop(config, recorder, state=None):
       record_goodput(recorder, RECORD_JOB_END_TIME)
     metric_logger_instance.flush_metrics_and_cleanup()
 
-  return jax_device_state["state"]
+  return state
 
 
 def initialize(argv: Sequence[str]) -> tuple[pyconfig.HyperParameters, Any]:
