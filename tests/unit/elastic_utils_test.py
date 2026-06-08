@@ -70,6 +70,8 @@ class ElasticUtilsTest(unittest.TestCase):
 
     # Configure default behaviors if needed
     self.fake_pathwaysutils.is_pathways_backend_used.return_value = True
+    self.fake_pathwaysutils.elastic = Mock()
+    self.fake_pathwaysutils.elastic.get_active_slice_indices.return_value = [0, 1]
     self.fake_jax.process_index.return_value = 0
 
     # Inject fakes into elastic_utils namespace
@@ -97,9 +99,37 @@ class ElasticUtilsTest(unittest.TestCase):
     elastic_utils.pending_elastic_event_type = None
     super().tearDown()
 
+
+  def test_record_slice_state(self):
+    elastic_utils.elastic_manager = self.fake_manager
+    self.fake_manager.active_slice_indices = {0}
+    self.fake_manager.slice_to_devices = {0: [FakeDevice()], 1: [FakeDevice()]}
+    self.fake_pathwaysutils.elastic.get_active_slice_indices.return_value = {0, 1}
+
+    fake_recorder = Mock()
+    fake_recorder.record_slice_state = Mock()
+    
+    elastic_utils.record_slice_state(fake_recorder)
+    
+    fake_recorder.record_slice_state.assert_called_once_with(
+        available_slices=2,
+        active_slices=1,
+        total_slices=2
+    )
+
+    fake_recorder.record_slice_state.reset_mock()
+    elastic_utils.record_slice_state(fake_recorder, active_slices_override=0)
+    fake_recorder.record_slice_state.assert_called_once_with(
+        available_slices=2,
+        active_slices=0,
+        total_slices=2
+    )
+
   def test_elastic_enabled(self):
     config = FakeConfig()
     self.fake_pathwaysutils.is_pathways_backend_used.return_value = True
+    self.fake_pathwaysutils.elastic = Mock()
+    self.fake_pathwaysutils.elastic.get_active_slice_indices.return_value = [0, 1]
     config.elastic_enabled = True
     self.assertTrue(elastic_utils.elastic_enabled(config))
 
@@ -144,6 +174,8 @@ class ElasticUtilsTest(unittest.TestCase):
   def test_live_devices_pathways(self):
     """Tests live_devices when pathways is used."""
     self.fake_pathwaysutils.is_pathways_backend_used.return_value = True
+    self.fake_pathwaysutils.elastic = Mock()
+    self.fake_pathwaysutils.elastic.get_active_slice_indices.return_value = [0, 1]
     device0 = FakeDevice(slice_index=0)
     device1 = FakeDevice(slice_index=1)
     self.fake_jax.devices.return_value = [device0, device1]
@@ -156,6 +188,8 @@ class ElasticUtilsTest(unittest.TestCase):
   def test_elastic_retry_disabled(self):
     """Tests elastic_retry when disabled but pathways is used."""
     self.fake_pathwaysutils.is_pathways_backend_used.return_value = True
+    self.fake_pathwaysutils.elastic = Mock()
+    self.fake_pathwaysutils.elastic.get_active_slice_indices.return_value = [0, 1]
     config = FakeConfig()
     config.elastic_enabled = False
     msg = (
@@ -315,6 +349,7 @@ class ElasticUtilsTest(unittest.TestCase):
     fake_recorder.record_custom_badput_event_start_time.assert_called_once_with(
         custom_badput_event_type='elastic_slice_down'
     )
+    fake_recorder.record_slice_state.assert_called_once()
     self.assertEqual(elastic_utils.pending_elastic_event_type, 'elastic_slice_down')
 
   def test_record_elastic_event_start_scale_up(self):
@@ -329,6 +364,7 @@ class ElasticUtilsTest(unittest.TestCase):
     fake_recorder.record_custom_badput_event_start_time.assert_called_once_with(
         custom_badput_event_type='elastic_scale_up'
     )
+    fake_recorder.record_slice_state.assert_called_once()
 
   def test_record_elastic_wait_end_and_reinit_start_noop_on_first_attempt(self):
     """Tests recording elastic event end and elastic reinit start."""
@@ -354,6 +390,7 @@ class ElasticUtilsTest(unittest.TestCase):
     fake_recorder.record_custom_badput_event_start_time.assert_called_once_with(
         custom_badput_event_type='elastic_reinitialization'
     )
+    fake_recorder.record_slice_state.assert_called_once()
     self.assertIs(elastic_utils.pending_reinit_recorder, fake_recorder)
     self.assertIsNone(elastic_utils.pending_elastic_event_type)
 
@@ -367,6 +404,7 @@ class ElasticUtilsTest(unittest.TestCase):
     fake_recorder.record_custom_badput_event_end_time.assert_called_once_with(
         custom_badput_event_type='elastic_reinitialization'
     )
+    fake_recorder.record_slice_state.assert_called_once()
     self.assertIsNone(elastic_utils.pending_reinit_recorder)
 
   def test_record_elastic_reinit_end_on_cold_start(self):
@@ -389,6 +427,8 @@ class ElasticUtilsTest(unittest.TestCase):
 
     config = ReadOnlyConfig()
     self.fake_pathwaysutils.is_pathways_backend_used.return_value = True
+    self.fake_pathwaysutils.elastic = Mock()
+    self.fake_pathwaysutils.elastic.get_active_slice_indices.return_value = [0, 1]
 
     # Should not raise ValueError
     elastic_utils.ensure_elastic_manager_initialized(config)
