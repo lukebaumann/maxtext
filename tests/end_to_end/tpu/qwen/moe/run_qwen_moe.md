@@ -1,7 +1,7 @@
-Qwen3
+Qwen
 =====
 
-Qwen3 is a family of open-source large language models from the Qwen team at Alibaba. This documentation covers the integration of the following Qwen3 Mixture-of-Experts (MoE) models into MaxText:
+Qwen3 is a family of open-source large language models from the Qwen team at Alibaba. This documentation covers the integration of the following Qwen Mixture-of-Experts (MoE) models into MaxText:
 
 -   **Qwen3-30B-A3B**
 
@@ -9,7 +9,13 @@ Qwen3 is a family of open-source large language models from the Qwen team at Ali
 
 -   **Qwen3-480B-A35B**
 
-For more details on the architecture, see the [Qwen3 Technical Report](https://arxiv.org/abs/2505.09388).
+-   **Qwen3.5-397B-A17B**
+
+-   **Qwen3.5-35B-A3B**
+
+For more details on Qwen3 architecture, see the [Qwen3 Technical Report](https://arxiv.org/abs/2505.09388).
+
+For more details on Qwen3.5 architecture, see the [Qwen3.5 Blog](https://qwen.ai/blog?id=qwen3.5)
 
 * * * * *
 
@@ -21,19 +27,19 @@ To get started, you first need a MaxText-compatible checkpoint.
 1.  **Download the Model**: Download the official model from Hugging Face. You can use a tool like `hf_transfer` for a fast download.
 
     ```
-    # Example for Qwen3-235B-A22B
-    hf_transfer download Qwen/Qwen3-235B-A22B-Thinking-2507 --local-dir /path/to/qwen3_hf_checkpoint
-
+    # Example for Qwen3.5-35B-A3B
+    hf_transfer download Qwen/Qwen3.5-35B-A3B --local-dir /path/to/qwen3.5_35b_hf_checkpoint
     ```
 
-2.  **Convert the Checkpoint**: Run the `convert_qwen3_moe.py` script to convert the downloaded Hugging Face weights into the Orbax format required by MaxText.
+2.  **Convert the Checkpoint**: Run the `convert_qwen3.5_35b_scanned.py` script to convert the downloaded Hugging Face weights into the Orbax format required by MaxText.
 
     ```
-    python3 -m maxtext.checkpoint_conversion.standalone_scripts.convert_qwen3_moe\
-      --base_model_path /path/to/qwen3_hf_checkpoint\
-      --maxtext_model_path gs://your-gcs-bucket/qwen3_maxtext_ckpt\
-      --model_size <qwen3-30b-a3b|qwen3-235b-a22b|qwen3-480b-a35b>
-
+    JAX_PLATFORMS=cpu python3 -m maxtext.checkpoint_conversion.to_maxtext src/maxtext/configs/base.yml \
+        model_name=qwen3.5-35b-a3b \
+        base_output_directory=gs://your-gcs-bucket/qwen3.5_35b_maxtext_ckpt \
+        hf_access_token=${HF_TOKEN} \
+        scan_layers=true \ # Set to false for unscanned checkpoint
+        use_multimodal=false
     ```
 
 * * * * *
@@ -133,4 +139,34 @@ export MAXTEXT_CHECKPOINT_PATH=gs://your-gcs-bucket/qwen3-480b-a35b_maxtext_ckpt
 
 # Execute the validation script
 bash tests/end_to_end/tpu/qwen/moe/qwen3-480b-a35b/1_test_qwen3_480b_a35b.sh
+```
+
+### Qwen3.5-35B-A3B
+
+Bash
+
+```
+# Set the required path to your converted MaxText checkpoint
+export MAXTEXT_CHECKPOINT_PATH=gs://your-gcs-bucket/qwen3.5-35b-a3b_maxtext_ckpt/0/items/
+
+# (Optional) Set the path to your local Hugging Face checkpoint
+# export HF_MODEL_PATH=/path/to/local/qwen3.5-35b-a3b_hf_checkpoint
+
+# Execute the validation script
+bash tests/end_to_end/tpu/qwen/moe/qwen3.5-35b-a3b/1_test_qwen3_480b_a35b.sh
+```
+
+### Qwen3.5-397B-A17B
+
+Bash
+
+```
+# Set the required path to your converted MaxText checkpoint
+export MAXTEXT_CHECKPOINT_PATH=gs://your-gcs-bucket/qwen3.5-397b-a17b_maxtext_ckpt/0/items/
+
+# (Optional) Set the path to your local Hugging Face checkpoint
+# export HF_MODEL_PATH=/path/to/local/qwen3.5-397b-a17b_hf_checkpoint
+
+# Execute the validation script
+bash tests/end_to_end/tpu/qwen/moe/qwen3.5-397b-a17b/1_test_qwen3_480b_a35b.sh
 ```
