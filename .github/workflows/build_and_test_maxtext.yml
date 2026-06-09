@@ -215,7 +215,7 @@ jobs:
       device_type: tpu
       device_name: v6e-4
       base_image: maxtext-unit-test-tpu:py312
-      cloud_runner: linux-x86-ct6e-180-4tpu
+      cloud_runner: linux-x86-ct6e-180-8tpu
       pytest_marker: 'not cpu_only and not gpu_only and integration_test and not post_training'
       pytest_addopts: '--ignore=tests/post_training --ignore=tests/integration/hlo_diff_test.py'
       xla_python_client_mem_fraction: 0.75
