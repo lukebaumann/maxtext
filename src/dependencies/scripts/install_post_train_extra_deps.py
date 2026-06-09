@@ -29,6 +29,10 @@ def main():
   It executes 'uv pip install -r <path_to_extra_deps.txt> --resolution=lowest'.
   """
   os.environ["VLLM_TARGET_DEVICE"] = "tpu"
+  os.environ["UV_TORCH_BACKEND"] = "cpu"
+  # Unset CUDA_HOME so torch's cmake module does not set CUDA_FOUND=True.
+  # vllm's CMakeLists.txt fatal-errors if CUDA_FOUND=True but nvcc is absent.
+  os.environ.pop("CUDA_HOME", None)
 
   current_dir = os.path.dirname(os.path.abspath(__file__))
   repo_root = os.path.abspath(os.path.join(current_dir, "..", ".."))
@@ -45,6 +49,17 @@ def main():
     print(f"Stderr: {e.stderr.decode()}")
     sys.exit(1)
 
+  build_tools_command = [
+      sys.executable,
+      "-m",
+      "uv",
+      "pip",
+      "install",
+      "ninja",
+      "cmake",
+      "setuptools_rust",
+  ]
+
   github_deps_command = [
       sys.executable,  # Use the current Python executable's pip to ensure the correct environment
       "-m",
@@ -54,6 +69,7 @@ def main():
       "-r",
       str(github_deps_path),
       "--no-deps",
+      "--no-build-isolation",
   ]
 
   local_vllm_install_command = [
@@ -67,14 +83,26 @@ def main():
   ]
 
   try:
+    print(f"Installing build tools: {' '.join(build_tools_command)}")
+    subprocess.run(build_tools_command, check=True, capture_output=True, text=True)
+    print("Build tools installed successfully!")
+
+    # Point cmake to the ninja binary
+    ninja_bin_dir = subprocess.check_output(
+        [sys.executable, "-c", "import ninja; print(ninja.BIN_DIR)"], text=True
+    ).strip()
+    os.environ["CMAKE_ARGS"] = (
+        f"-DCMAKE_MAKE_PROGRAM={os.path.join(ninja_bin_dir, 'ninja')}" " -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON"
+    )
+
     # Run the command to install Github dependencies
     print(f"Installing Github dependencies: {' '.join(github_deps_command)}")
-    _ = subprocess.run(github_deps_command, check=True, capture_output=True, text=True)
+    _ = subprocess.run(github_deps_command, check=True, capture_output=True, text=True, env=os.environ)
     print("Github dependencies installed successfully!")
 
     # Run the command to install the MaxText vLLM directory
     print(f"Installing MaxText vLLM dependency: {' '.join(local_vllm_install_command)}")
-    _ = subprocess.run(local_vllm_install_command, check=True, capture_output=True, text=True)
+    _ = subprocess.run(local_vllm_install_command, check=True, capture_output=True, text=True, env=os.environ)
     print("MaxText vLLM dependency installed successfully!")
   except subprocess.CalledProcessError as e:
     print("Failed to install extra dependencies.")

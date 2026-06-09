@@ -227,9 +227,17 @@ install_post_training_deps() {
       exit 1
     fi
     echo "Setting up MaxText post-training workflow for $DEVICE device"
+
+    # Install build tools needed to compile vllm from source.
+    apt-get update -y && apt-get install -y --no-install-recommends build-essential ninja-build
+
+    # Unset CUDA env vars so torch's cmake module does not detect CUDA and
+    # vllm's build targets TPU without requiring a CUDA toolkit.
+    unset CUDA_HOME CUDA_ROOT CUDA_PATH CUDA_TOOLKIT_ROOT_DIR
+
     dep_name='src/dependencies/requirements/generated_requirements/tpu-post-train-requirements.txt'
     echo "Installing requirements from $dep_name"
-    python3 -m uv pip install --resolution=lowest -r "$dep_name"
+    UV_TORCH_BACKEND=cpu python3 -m uv pip install --resolution=lowest -r "$dep_name"
     python3 -m src.dependencies.scripts.install_post_train_extra_deps
 }
 
