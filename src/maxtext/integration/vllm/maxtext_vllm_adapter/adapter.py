@@ -40,6 +40,15 @@ except ImportError:
 
 from vllm.config import VllmConfig
 
+GLOBAL_PROMPT_LOGPROBS = {}
+
+def _store_prompt_logprobs(input_ids, logprobs):
+  import numpy as np
+  input_ids_np = np.array(input_ids)
+  logprobs_np = np.array(logprobs)
+  for b in range(input_ids_np.shape[0]):
+    key = tuple(input_ids_np[b].tolist())
+    GLOBAL_PROMPT_LOGPROBS[key] = logprobs_np[b]
 
 def next_power_of_two(x: int) -> int:
   """Finds the smallest power of 2 >= x using bit manipulation.
@@ -246,6 +255,15 @@ class MaxTextForCausalLM(nnx.Module):
 
       # To be compatible with vLLM, we reshape to (batch * seq, dim).
       hidden = hidden.reshape((-1, hidden.shape[-1]))
+
+      try:
+        if input_ids.shape[1] > 1:
+          logits = self.compute_logits(hidden)
+          logits_3d = logits.reshape((input_ids.shape[0], input_ids.shape[1], -1))
+          logprobs = jax.nn.log_softmax(logits_3d, axis=-1)
+          jax.debug.callback(_store_prompt_logprobs, input_ids, logprobs)
+      except Exception:
+        pass
 
     return kv_caches, hidden, aux_hidden_states, expert_indices
 
