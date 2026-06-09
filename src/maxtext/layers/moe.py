@@ -88,6 +88,8 @@ class RouteOutput:
   lb_loss: Optional[jax.Array]
   # Dynamic bias updates for loss-free load balancing, used only for Deepseek models
   bias_updates: Optional[jax.Array]
+  # Shape [local experts], tracks number of local tokens routed to every local expert.
+  local_group_sizes: Optional[jax.Array] = None
 
 
 def _sort_activations(
@@ -845,6 +847,7 @@ class RoutedMoE(nnx.Module):
           total_repeat_length=buffer_size,
       )
     else:
+      local_group_size = None
       expert_indices = jnp.arange(self.num_experts)
       sorted_experts = jnp.repeat(
           expert_indices,
@@ -860,6 +863,7 @@ class RoutedMoE(nnx.Module):
         sorted_experts,
         lb_loss,
         bias_updates,
+        local_group_size,
     )
 
   def unpermute(
@@ -1422,6 +1426,7 @@ class RoutedMoE(nnx.Module):
             selected_experts,
             lb_loss,
             bias_updates,
+            local_group_sizes,
         ) = self.permute(
             x,
             logits,
@@ -1440,6 +1445,7 @@ class RoutedMoE(nnx.Module):
             selected_experts,
             lb_loss,
             bias_updates,
+            local_group_sizes,
         ) = self.permute(x, logits, pre_bias_logits, self.config.use_custom_sort_vjp, rngs)
 
         if num_ep > 1:
@@ -1505,6 +1511,7 @@ class RoutedMoE(nnx.Module):
               weights=weights,
               lb_loss=lb_loss,
               bias_updates=bias_updates,
+              local_group_sizes=local_group_sizes,
           ),
           RouteMetadata(
               expert_shard_id=expert_shard_id,
@@ -1616,12 +1623,7 @@ class RoutedMoE(nnx.Module):
       is_buffering = self.config.use_ring_of_experts and x.shape[0] < routing.sorted_selected_experts.shape[0]
 
       if is_buffering:
-        local_group_sizes = jax.lax.dynamic_slice_in_dim(
-            routing.group_sizes,
-            real_experts_start,
-            num_experts_per_shard,
-            axis=0,
-        )
+        local_group_sizes = routing.local_group_sizes
         gmm_fn = functools.partial(
             gmm,
             group_sizes=local_group_sizes,

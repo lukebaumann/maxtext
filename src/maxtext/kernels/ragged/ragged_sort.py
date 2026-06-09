@@ -163,13 +163,11 @@ def ring_ragged_sort(
           reduce_group_size=topk,
       )
     else:
-      valid_rows_mask = (topk_argsort_revert_indices >= shard_output_start) & (
-          topk_argsort_revert_indices < shard_output_end
-      )
-      valid_rows_mask = valid_rows_mask & (topk_argsort_revert_indices < shard_output_start + local_buffer_size)
+      limit = jnp.minimum(shard_output_end, shard_output_start + local_buffer_size)
+      valid_rows_mask = (topk_argsort_revert_indices >= shard_output_start) & (topk_argsort_revert_indices < limit)
 
       shifted_indices = topk_argsort_revert_indices - shard_output_start
-      safe_indices = jnp.clip(shifted_indices, 0, local_buffer_size - 1)
+      safe_indices = jnp.where(valid_rows_mask, shifted_indices, 0)
 
       grad_hidden_states = ragged_gather_reduce(
           g_x,
@@ -258,13 +256,11 @@ def ring_ragged_unsort(
           reduce_group_size=1,
       )
     else:
-      valid_rows_mask = (topk_argsort_revert_indices >= shard_output_start) & (
-          topk_argsort_revert_indices < shard_output_end
-      )
-      valid_rows_mask = valid_rows_mask & (topk_argsort_revert_indices < shard_output_start + buffer_size)
+      limit = jnp.minimum(shard_output_end, shard_output_start + buffer_size)
+      valid_rows_mask = (topk_argsort_revert_indices >= shard_output_start) & (topk_argsort_revert_indices < limit)
 
       shifted_indices = topk_argsort_revert_indices - shard_output_start
-      safe_indices = jnp.clip(shifted_indices, 0, buffer_size - 1)
+      safe_indices = jnp.where(valid_rows_mask, shifted_indices, 0)
 
       out = ragged_gather_reduce(
           sorted_tokens_local,
